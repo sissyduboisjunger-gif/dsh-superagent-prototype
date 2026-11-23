@@ -1,0 +1,160 @@
+name: Gerar codigo com IA (NVIDIA)
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: read
+
+concurrency:
+  group: ia-issue-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  gerar-codigo:
+    # Somente Issues abertas pelo dono do repositorio e com o prefixo [IA].
+    if: >-
+      github.event.issue.user.login == github.repository_owner &&
+      startsWith(github.event.issue.title, '[IA]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+      NVIDIA_MODEL: ${{ vars.NVIDIA_MODEL }}
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Baixar repositorio
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Pedir codigo ao modelo NVIDIA
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+          import sys
+          import urllib.error
+          import urllib.request
+
+          issue = json.loads(pathlib.Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))["issue"]
+          number = int(os.environ["ISSUE_NUMBER"])
+          key = os.environ.get("NVIDIA_API_KEY", "")
+          model = os.environ.get("NVIDIA_MODEL", "").strip()
+          if not key or not model:
+              sys.exit("Faltam NVIDIA_API_KEY (Secret) ou NVIDIA_MODEL (Variable).")
+
+          title = issue.get("title", "")[:300]
+          body = (issue.get("body") or "")[:7000]
+          instructions = (
+              "Voce e um programador. Produza codigo completo a partir da tarefa do usuario. "
+              "Responda somente com um objeto JSON valido, sem blocos Markdown nem comentarios: "
+              '{"files":[{"path":"app.py","content":"codigo completo"}]}. '
+              "Use de 1 a 5 arquivos; path e relativo, sem barras iniciais, sem .. e sem prefixo de pasta. "
+              "Os arquivos serao colocados numa pasta isolada e revisados antes de entrar no projeto. "
+              "Nao inclua chaves, senhas, credenciais, segredos ou instrucoes para coletar dados privados. "
+              "Nao crie arquivos de workflow GitHub nem altere configuracoes do repositorio. "
+              "Responda em JSON estrito, com conteudos escapados corretamente."
+          )
+          payload = json.dumps({
+              "model": model,
+              "messages": [
+                  {"role": "system", "content": instructions},
+                  {"role": "user", "content": f"Tarefa GitHub #{number}:\n{title}\n\nDetalhes:\n{body}"}
+              ],
+              "temperature": 0.2,
+              "max_tokens": 8192,
+              "stream": False
+          }).encode("utf-8")
+          request = urllib.request.Request(
+              "https://integrate.api.nvidia.com/v1/chat/completions",
+              data=payload,
+              headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
+              method="POST",
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=240) as response:
+                  result = json.load(response)
+          except urllib.error.HTTPError as error:
+              # Nao exponha a chave nem o conteudo da requisicao nos logs.
+              sys.exit(f"NVIDIA retornou HTTP {error.code}. Confira chave, modelo e cota gratuita.")
+          except Exception as error:
+              sys.exit(f"Nao foi possivel chamar a API NVIDIA: {type(error).__name__}")
+
+          choices = result.get("choices") or []
+          answer = ((choices[0].get("message") or {}).get("content") if choices else "") or ""
+          if not isinstance(answer, str) or not answer.strip():
+              sys.exit("Modelo nao devolveu codigo em texto. Verifique o endpoint e os logs.")
+
+          def decode_files(text):
+              text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+              fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.S | re.I)
+              if fenced:
+                  text = fenced.group(1)
+              start = text.find("{")
+              if start < 0:
+                  raise ValueError("Nao ha JSON")
+              obj, _ = json.JSONDecoder().raw_decode(text[start:])
+              if not isinstance(obj, dict) or not isinstance(obj.get("files"), list):
+                  raise ValueError("Formato inesperado")
+              return obj["files"]
+
+          try:
+              files = decode_files(answer)
+          except (ValueError, TypeError, json.JSONDecodeError):
+              # Se o modelo ignorar o formato pedido, ainda abrimos um PR com a resposta.
+              files = [{"path": "resposta-do-modelo.txt", "content": answer}]
+
+          folder = pathlib.Path("ia-gerada") / f"issue-{number}"
+          folder.mkdir(parents=True, exist_ok=True)
+          created = 0
+          for item in files[:5]:
+              if not isinstance(item, dict):
+                  continue
+              name, content = item.get("path", ""), item.get("content", "")
+              if not isinstance(name, str) or not isinstance(content, str) or not content.strip():
+                  continue
+              name = name.replace("\\", "/")
+              parts = name.split("/")
+              if (len(parts) > 4 or not parts or any(
+                  p in ("", ".", "..") or p.startswith(".") for p in parts
+              )):
+                  continue
+              if len(content.encode("utf-8")) > 120000:
+                  continue
+              dest = folder.joinpath(*parts)
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              dest.write_text(content, encoding="utf-8")
+              created += 1
+          if not created:
+              sys.exit("A resposta do modelo nao continha arquivos validos.")
+          print(f"Gerados {created} arquivo(s) em {folder} para revisao.")
+          PY
+
+      - name: Abrir Pull Request para revisao
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          BRANCH="ia/issue-${ISSUE_NUMBER}-${GITHUB_RUN_ID}"
+          git switch -c "$BRANCH"
+          git add "ia-gerada/issue-${ISSUE_NUMBER}/"
+          if git diff --cached --quiet; then
+            echo "Nenhum arquivo novo para registrar."
+            exit 1
+          fi
+          git commit -m "IA: gerar codigo para issue #${ISSUE_NUMBER}"
+          git push -u origin "$BRANCH"
+          gh pr create \
+            --title "[IA] Codigo gerado para Issue #${ISSUE_NUMBER}" \
+            --body "Gerado pela NVIDIA com o modelo configurado em NVIDIA_MODEL. Arquivos em ia-gerada/issue-${ISSUE_NUMBER}/. **Revise e teste antes de usar.** Fecha #${ISSUE_NUMBER} quando mesclado." \
+            --head "$BRANCH" \
+            --draft
